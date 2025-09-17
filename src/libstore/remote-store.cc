@@ -313,6 +313,8 @@ ref<const ValidPathInfo> RemoteStore::addCAToStore(
     const StorePathSet & references,
     RepairFlag repair)
 {
+    static std::set<std::string> seen;
+
     std::optional<ConnectionHandle> conn_(getConnection());
     auto & conn = *conn_;
 
@@ -332,9 +334,15 @@ ref<const ValidPathInfo> RemoteStore::addCAToStore(
                 });
 
         auto dstPath = makeFixedOutputPathFromCA(name, desc);
-        std::string path = "/nix/store/" + dstPath.to_string();
+        auto basename = std::string(dstPath.to_string());
 
+        if (seen.contains(basename)) {
+            return make_ref<ValidPathInfo>(dstPath, UnkeyedValidPathInfo(Hash(hashAlgo)));
+        }
+
+        std::string path = "/nix/store/" + basename;
         if (access(path.c_str(), F_OK) == 0) {
+            seen.insert(basename);
             return make_ref<ValidPathInfo>(dstPath, UnkeyedValidPathInfo(Hash(hashAlgo)));
         }
 
@@ -349,7 +357,9 @@ ref<const ValidPathInfo> RemoteStore::addCAToStore(
             conn.withFramedSink([&](Sink & sink) { dump2.drainInto(sink); });
         }
 
-        return make_ref<ValidPathInfo>(WorkerProto::Serialise<ValidPathInfo>::read(*this, *conn));
+        auto rv = make_ref<ValidPathInfo>(WorkerProto::Serialise<ValidPathInfo>::read(*this, *conn));
+        seen.insert(basename);
+        return rv;
     } else {
         if (repair)
             throw Error("repairing is not supported when building through the Nix daemon protocol < 1.25");
