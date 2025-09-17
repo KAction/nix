@@ -148,10 +148,15 @@ std::unique_ptr<Logger> makeSimpleLogger(bool printBuildLogs)
 
 std::atomic<uint64_t> nextId{0};
 
+static thread_local pid_t _my_pid = 0;
+
 static uint64_t getPid()
 {
 #ifndef _WIN32
-    return getpid();
+    if (!_my_pid) {
+        _my_pid = getpid();
+    }
+    return _my_pid;
 #else
     return GetCurrentProcessId();
 #endif
