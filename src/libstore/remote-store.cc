@@ -317,17 +317,36 @@ ref<const ValidPathInfo> RemoteStore::addCAToStore(
     auto & conn = *conn_;
 
     if (GET_PROTOCOL_MINOR(conn->protoVersion) >= 25) {
+        auto content = [&]() {
+            // The dump source may invoke the store, so we need to make some room.
+            connections->incCapacity();
+            Finally cleanup([&]() { connections->decCapacity(); });
+            return dump.drain();
+        } ();
+
+        auto hashSink = HashSink(hashAlgo);
+        hashSink(content);
+        auto [dumpHash, size] = hashSink.finish();
+
+        auto desc = ContentAddressWithReferences::fromParts(
+                caMethod,
+                dumpHash,
+                { .others = references,
+                  .self = false,
+                });
+
+        auto dstPath = makeFixedOutputPathFromCA(name, desc);
+        std::string path = "/nix/store/" + dstPath.to_string();
+
+        if (access(path.c_str(), F_OK) == 0) {
+            return make_ref<ValidPathInfo>(dstPath, UnkeyedValidPathInfo(Hash(hashAlgo)));
+        }
 
         conn->to << WorkerProto::Op::AddToStore << name << caMethod.renderWithAlgo(hashAlgo);
         WorkerProto::write(*this, *conn, references);
         conn->to << repair;
 
-        // The dump source may invoke the store, so we need to make some room.
-        connections->incCapacity();
-        {
-            Finally cleanup([&]() { connections->decCapacity(); });
-            conn.withFramedSink([&](Sink & sink) { dump.drainInto(sink); });
-        }
+        conn.withFramedSink([&](Sink & sink) { sink(content); });
 
         return make_ref<ValidPathInfo>(WorkerProto::Serialise<ValidPathInfo>::read(*this, *conn));
     } else {
