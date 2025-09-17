@@ -1,3 +1,5 @@
+#include <sqlite3.h>
+
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/primops.hh"
@@ -2388,12 +2390,67 @@ BackedStringView EvalState::coerceToString(
         .debugThrow();
 }
 
+static thread_local sqlite3 *cache = NULL;
+static thread_local sqlite3_stmt *cache_get = NULL;
+static thread_local sqlite3_stmt *cache_set = NULL;
+
 StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePath & path)
 {
     if (nix::isDerivation(path.path.abs()))
         error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
 
+    if (!cache) {
+        if (sqlite3_open("/tmp/cache.sqlite3", &cache) != SQLITE_OK) {
+            sqlite3_close(cache);
+            cache = NULL;
+        } else {
+            char *errmsg;
+            if (sqlite3_exec(cache
+                            , "CREATE TABLE IF NOT EXISTS cache(input blob, output blob);\n"
+                              "CREATE UNIQUE INDEX IF NOT EXISTS the_index ON cache(input);\n"
+                            , NULL
+                            , NULL
+                            , &errmsg) != SQLITE_OK) {
+                fprintf(stderr, "sqlite: %s\n", errmsg);
+                sqlite3_free(errmsg);
+                sqlite3_close(cache);
+                cache = NULL;
+            }
+        }
+    }
+
+    if (cache && !cache_get) {
+        sqlite3_prepare(cache, "SELECT output FROM cache WHERE input = ?", 1000, &cache_get, NULL);
+    }
+    if (cache && !cache_set) {
+        sqlite3_prepare(cache, "INSERT INTO cache(input, output) VALUES (?, ?) ON CONFLICT DO NOTHING", 1000, &cache_set, NULL);
+    }
+
+
     auto dstPathCached = getConcurrent(*srcToStore, path);
+    std::string abspath = path.path.abs();
+
+    if (!dstPathCached && cache && cache_get && abspath.starts_with("/nix/store/")) {
+        sqlite3_bind_blob(cache_get, 1, abspath.data(), abspath.length(), SQLITE_STATIC);
+        if (sqlite3_step(cache_get) == SQLITE_ROW) {
+            const void *ptr = sqlite3_column_blob(cache_get, 0);
+            int   len = sqlite3_column_bytes(cache_get, 0);
+            auto dstPath = StorePath(std::string((const char *)ptr, len));
+
+            sqlite3_reset(cache_get);
+            sqlite3_clear_bindings(cache_get);
+
+            allowPath(dstPath);
+            srcToStore->try_emplace(path, dstPath);
+            context.insert(NixStringContextElem::Opaque{.path = dstPath});
+
+            return dstPath;
+        } else {
+            sqlite3_reset(cache_get);
+            sqlite3_clear_bindings(cache_get);
+        }
+    }
+
 
     auto dstPath = dstPathCached ? *dstPathCached : [&]() {
         auto dstPath = fetchToStore(
@@ -2410,6 +2467,17 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
         printMsg(lvlChatty, "copied source '%1%' -> '%2%'", path, store->printStorePath(dstPath));
         return dstPath;
     }();
+
+    if (cache && cache_set && abspath.starts_with("/nix/store/")) {
+        sqlite3_bind_blob(cache_set, 1, abspath.data(), abspath.length(), SQLITE_STATIC);
+        sqlite3_bind_blob(cache_set, 2, dstPath.to_string().data(), dstPath.to_string().length(), SQLITE_STATIC);
+        if (sqlite3_step(cache_set) != SQLITE_DONE) {
+            std::cerr << "We all are going to die!!!" << std::endl;
+        }
+
+        sqlite3_reset(cache_set);
+        sqlite3_clear_bindings(cache_set);
+    }
 
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
     return dstPath;
