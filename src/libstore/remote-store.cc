@@ -169,13 +169,6 @@ void RemoteStore::setOptions()
     setOptions(*(getConnection().handle));
 }
 
-bool RemoteStore::isValidPathUncached(const StorePath & path)
-{
-    auto conn(getConnection());
-    conn->to << WorkerProto::Op::IsValidPath << printStorePath(path);
-    conn.processStderr();
-    return readInt(conn->from);
-}
 
 
 StorePathSet RemoteStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
@@ -364,6 +357,26 @@ std::optional<StorePath> RemoteStore::queryPathFromHashPart(const std::string & 
 
 static std::set<std::string> seen;
 static std::mutex seen_mutex;
+
+bool RemoteStore::isValidPathUncached(const StorePath & path)
+{
+    auto basename = std::string(path.to_string());
+    {
+        std::scoped_lock<std::mutex> lock(seen_mutex);
+        if (seen.contains(basename)) {
+            return true;
+        }
+    }
+
+    std::string abs = "/nix/store/" + path.to_string();
+    if (access(abs.c_str(), F_OK) == 0) {
+        std::scoped_lock<std::mutex> lock(seen_mutex);
+        seen.insert(basename);
+        return true;
+    }
+
+    return false;
+}
 
 ref<const ValidPathInfo> RemoteStore::addCAToStore(
         Source & dump,
